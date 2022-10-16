@@ -1,0 +1,727 @@
+---
+title: "Trabajo Final Wisconsin"
+author: "Diego Maquedano Pedrero. NIU: 100385221"
+date: "10 enero 2021"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r, warning=FALSE, message=FALSE, fig.align='center', echo=FALSE}
+knitr::opts_chunk$set(warning=FALSE, message=FALSE, fig.align='center', echo=TRUE)
+```
+
+# Introducción y preproceso de los datos
+
+En esta práctica lo que se va a analizar es un conjunto de datos proveniente de un parque de atracciones de Wisconsin en el que los datos están recogidos a modo de encuesta y se pretende conocer más sobre la tipología y características de los clientes.
+
+Antes que nada, compruebo si los paquetes a emplear están correctamente cargados pasándolos como argumento a la función comprobar creada:
+
+```{r}
+comprobar <- function(pkg){
+    new.pkg <- pkg[!(pkg %in% installed.packages()[, "Package"])]
+    if (length(new.pkg)) 
+        install.packages(new.pkg, dependencies = TRUE)
+    sapply(pkg, require, character.only = TRUE)
+}
+paquetes<-c("tidyverse","factoextra","FactoMineR","plfm","cluster",
+            "ggplot2","VIM","mice","corrplot","psych","Hmisc",
+            "NbClust","anacor","ca","gplots","naniar","missMDA","gmodels",
+            "scales","descr","caret")
+comprobar(paquetes)
+```
+
+A continuación, descargo los datos (se puede emplear choose.file() para replicar pero en markdown no funciona) en el directorio de trabajo que voy a utilizar. A su vez, establezco que el nombre de las filas sea el ID del cliente para más comodidad:
+
+```{r}
+setwd("C:/Users/Diego/Desktop/Introduction to data mining/TRabajo_final_individual_2")
+datos<-read.csv("wisconsin_dells.csv",row.names = 1)
+```
+
+Explorando los datos en Excel, se comprueba que, efectivamnete, es un conjunto de datos obtenido mediante encuesta pues la totalidad de las variables son categóricas o binarias por lo que se deberá emplear un análisis de correspondencia múltiple y un enfoque más destinado a contemplar porcentajes por la parte descriptiva.
+
+Como siempre, conviene echar un vistazo general a los datos para comprobar observaciones faltantes o características generales:
+
+```{r}
+glimpse(datos)
+colSums(is.na(datos))
+apply(datos, 2, range)
+```
+
+Todas las variables son string porque, aunque hay algunas discretas, poseen caracteres como el signo + para indicar un valor superior a las posibilidades dadas. Si se intenta ver cuántos datos faltantes hay considerando NA el resultado es que no existe ninguno pero viendo, por ejemplo la variable income:
+
+```{r}
+head(datos$income,5)
+```
+
+Se ve que hay casillas vacías que, bien puede deberse a que el cliente se negó a facilitar la información o simplemente se ha perdido. Estos datos, para un tratamiento más claro de los mismos, es mejor sustituirlos por NA, siendo el primer paso sustituir los espacios vacíos por NA:
+
+```{r}
+datos<-mutate_all(datos, list(~na_if(.,"")))
+```
+
+Y, a continuación, usar paquetes que permitan sustituir estos datos por valores estimados usando; por ejemplo, regresiones.
+
+```{r}
+plot_NA <- aggr(datos, col=c('lightblue','red'), numbers=TRUE,
+                  sortVars=TRUE, labels=names(datos),
+                  cex.axis=.3,
+                  gap=3, ylab=c("Histogram of missing data","Pattern"))
+```
+
+El gráfico previo muestra que el 82% de las observaciones no contienen NA siendo la variable que más posee income.
+Otra alternativa muy buena a ver estos datos faltantes es usando la librería naniar que posee múltiples funciones para ello:
+
+```{r}
+gg_miss_var(datos)
+```
+
+Este gráfico es muy sencillo y enseña que sólo las variables income, education, region y age poseen NA. 
+Otra manera más:
+
+```{r}
+gg_miss_upset(datos)
+```
+
+Este es más complejo y a parte de mostrar NA, muestra intersecciones entre variables calificadas de esa misma manera. Por ejemplo, hay 5 observaciones en las que age, education e income tienen NA. El resto de gráfico es interpretable de manera análoga.
+
+Se podría considerar la eliminación de estas observaciones, pero la proporción de datos faltantes (11%) es muy elevada así que es mejor sustituirlas usando la función imputeMCA del paquete missMCA que introduce estos NA mediante Análisis de Correspondencia Múltiple. 
+
+Antes de hacerlo, convierto esas variables en factores para que resulte más rápida la elección de posibles valores (posteriormente es más conveniente convertir todas las variables a factor):
+
+```{r}
+datos$age<-as.factor(datos$age)
+datos$income<-as.factor(datos$income)
+datos$region<-as.factor(datos$region)
+datos$education<-as.factor(datos$education)
+datos_completos<-imputeMCA(datos)
+datos_completos<-datos_completos$completeObs
+```
+
+Compruebo si ya no hay ninguna observación NA:
+
+```{r}
+plot_NA <- aggr(datos_completos, col=c('lightblue','red'), numbers=TRUE,
+                  sortVars=TRUE, labels=names(datos),
+                  cex.axis=.3,
+                  gap=3, ylab=c("Histogram of missing data","Pattern"))
+```
+
+Efectivamnete, no hay ya observaciones faltantes y tenemos una ligera idea de qué tipo de datos se van a analizar. El siguiente paso corresponde al análisis descriptivo de todo el dataset.
+
+# Análisis del conjunto de datos 
+
+El principal problema que atañe a esta base de datos es que todas las variables son categóricas y podrían considerarse como factores por lo que la parte descriptiva usual que se utilizaría en un dataset con datos numéricos no se puede llevar a cabo, al no tener sentido medidas como devsiación típica, medias, etc.
+
+Para empezar, puede ser interesante comprender primero cuáles son las características del público por separado (es decir, edades, hijos, etc.) y luego ver cómo se identifican con las atracciones que visitan.
+
+Una buena técnica es ver cuántos visitantes para cada uno de los distintos niveles de los factores hay en cada variable, por ejemplo, cuál es el número de noches o el número de hijos más frecuente y expresarlo a modo de porcentaje mediante un gráfico de barras para sacar conclusiones sobre la tipología general de clientes. Lo mostraré con una serie de ggplots que representan tablas de frecuencias obtenidas para cada variable:
+
+```{r}
+nnights<-table(datos_completos$nnights)
+nnights<-prop.table(nnights)
+nnights<-as.data.frame(nnights)
+names(nnights)<-c("Noches", "Porcentaje")
+
+ggplot(data=nnights, mapping=aes(x=Noches, y=Porcentaje)) + 
+  geom_col(fill="blue", alpha=0.5) +
+  scale_y_continuous(label=percent) +
+  labs(title="Noches que pasan los visitantes",
+    subtitle="Porcentaje de personas para 0, 1, 2, 3 o 4+ noches",
+    x="", y="") +
+  theme_bw() + 
+  theme(title=element_text(size=14), axis.text=element_text(size=12)) +
+  theme(panel.grid.major.x = element_blank()) +
+  geom_text(mapping=aes(x=Noches, y=Porcentaje,
+                        label=percent(Porcentaje)), size=5, nudge_y=0.03)
+```
+
+La mayoría de los visitantes pasan el día en el parque y luego vuelven o bien pasan más de 2 noches siendo más de 4 no tan frecuente. Es lógica este resultado pues el parque se encuentra no muy alejado, pero tampoco próximo a las grandes ciudades por lo que sirve tanto para pasar el día a la gente que pueda llegar cerca como para estar algunos días de vacaciones quienes vivan más alejados.
+
+Respecto al número de adultos:
+
+```{r}
+nadults<-table(datos_completos$nadults)
+nadults<-prop.table(nadults)
+nadults<-as.data.frame(nadults)
+names(nadults)<-c("Adultos", "Porcentaje")
+
+ggplot(data=nadults, mapping=aes(x=Adultos, y=Porcentaje)) + 
+  geom_col(fill="blue", alpha=0.5) +
+  scale_y_continuous(label=percent) +
+  labs(title="Grupos que visitan el parque",
+    subtitle="Número de personas en cada grupo",
+    x="", y="") +
+  theme_bw() + 
+  theme(title=element_text(size=14), axis.text=element_text(size=12)) +
+  theme(panel.grid.major.x = element_blank()) +
+  geom_text(mapping=aes(x=Adultos, y=Porcentaje,
+                        label=percent(Porcentaje)), size=5, nudge_y=0.03)
+```
+
+La enorme mayoría de grupos que visitan el parque incluyen 2 adultos en el grupo (sin contar los niños) lo que resulta evidente pues se tratan de padres y madres que van con los hijos a pasarlo bien o parejas. Tanto ir sólo como grupos muy numerosos son lo menos usual.
+
+Respecto al número de hijos:
+
+```{r}
+nchildren<-table(datos_completos$nchildren)
+nchildren<-prop.table(nchildren)
+nchildren<-as.data.frame(nchildren)
+names(nchildren)<-c("Hijos", "Porcentaje")
+
+ggplot(data=nchildren, mapping=aes(x=Hijos, y=Porcentaje)) + 
+  geom_col(fill="blue", alpha=0.5) +
+  scale_y_continuous(label=percent) +
+  labs(title="Hijos por visitante",
+    subtitle="Número de hijos por visitante",
+    x="", y="") +
+  theme_bw() + 
+  theme(title=element_text(size=14), axis.text=element_text(size=12)) +
+  theme(panel.grid.major.x = element_blank()) +
+  geom_text(mapping=aes(x=Hijos, y=Porcentaje,
+                        label=percent(Porcentaje)), size=5, nudge_y=0.03)
+```
+
+Parece ser que la mayoría de gente que acude al parque va con 2 niños o ninguno (si sumamos los porcentajes dan como resultado casi el total de grupos con 2 adultos). Que haya un 15% con 4 o más de 5 niños no debe sorprender ya qu eno se menciona que sean hijos y pueden ser amigos, sobrinos, etc.
+
+Respecto a la antelación en la planificación:
+
+```{r}
+planning<-table(datos_completos$planning)
+planning<-prop.table(planning)
+planning<-as.data.frame(planning)
+names(planning)<-c("Planes", "Porcentaje")
+
+ggplot(data=planning, mapping=aes(x=Planes, y=Porcentaje)) + 
+  geom_col(fill="blue", alpha=0.5) +
+  scale_y_continuous(label=percent) +
+  labs(title="Planificación por visitante",
+    subtitle="Con cuánta antelación se ha planificado la visita",
+    x="", y="") +
+  theme_bw() + 
+  theme(title=element_text(size=14), axis.text=element_text(size=12)) +
+  theme(panel.grid.major.x = element_blank()) +
+  geom_text(mapping=aes(x=Planes, y=Porcentaje,
+                        label=percent(Porcentaje)), size=5, nudge_y=0.03)
+```
+
+Más de la mitad de los visitantes planean la visita con más de 1 mes de antelación (da una idea de la gente que vive más alejada o que quiere visitar todo a conciencia) siendo lo segundo más frecuente que se haya planeado esta semana (quizá por promociones, ofertas o vivir más cerca)
+
+Por sexo:
+
+```{r}
+sex<-table(datos_completos$sex)
+sex<-prop.table(sex)
+sex<-as.data.frame(sex)
+names(sex)<-c("Sexo", "Porcentaje")
+
+ggplot(data=sex, mapping=aes(x=Sexo,Porcentaje)) + 
+  geom_col(fill="blue", alpha=0.5) +
+  scale_y_continuous(label=percent) +
+  labs(title="Sexo de los visitantes",
+    x="", y="") +
+  theme_bw() + 
+  theme(title=element_text(size=14), axis.text=element_text(size=12)) +
+  theme(panel.grid.major.x = element_blank()) +
+  geom_text(mapping=aes(x=Sexo, y=Porcentaje,
+                        label=percent(Porcentaje)), size=5, nudge_y=0.03)
+```
+
+El porcentaje de mujeres que acude es ligeramente superior a hombres. Tampoco es un factor extremadamente condicionante del análisis.
+
+Respecto a la edad:
+
+```{r}
+age<-table(datos_completos$age)
+age<-prop.table(age)
+age<-as.data.frame(age)
+names(age)<-c("Edad", "Porcentaje")
+
+ggplot(data=age, mapping=aes(x=Edad,Porcentaje)) + 
+  geom_col(fill="blue", alpha=0.5) +
+  scale_y_continuous(label=percent) +
+  labs(title="Distribución por edades",
+    subtitle="Franjas de edades de los visitantes",
+    x="", y="") +
+  theme_bw() + 
+  theme(title=element_text(size=14), axis.text=element_text(size=12)) +
+  theme(panel.grid.major.x = element_blank()) +
+  geom_text(mapping=aes(x=Edad, y=Porcentaje,
+                        label=percent(Porcentaje)), size=5, nudge_y=0.03)
+```
+
+Las edades también cumplen lo que esperaríamos ver entre los visitantes a complejos recreativos o parques temáticos. Casi la mitad es gente de mediana edad (entre 35 y 44 años) en edad de tener hijos pequeños; luego están jóvenes de entre 20 y 30 años que seguramente serán grupos de amigos o parejas y la proporción va decayendo conforme más se acercan a la vejez.
+
+Por niveles de educación:
+
+```{r}
+education<-table(datos_completos$education)
+education<-prop.table(education)
+education<-as.data.frame(education)
+names(education)<-c("Educacion", "Porcentaje")
+
+ggplot(data=education, mapping=aes(x=Educacion,Porcentaje)) + 
+  geom_col(fill="blue", alpha=0.5) +
+  scale_y_continuous(label=percent) +
+  labs(title="Nivel de educación",
+    subtitle="Educación más alta completada por cada visitante",
+    x="", y="") +
+  theme_bw() + 
+  theme(title=element_text(size=14), axis.text=element_text(size=12)) +
+  theme(panel.grid.major.x = element_blank()) +
+  geom_text(mapping=aes(x=Educacion, y=Porcentaje,
+                        label=percent(Porcentaje)), size=5, nudge_y=0.03)
+```
+
+En el nivel de educación no hay ningún predominio claro, más bien se asemeja a la realidad, es decir, el número de personas con niveles más altos de educación es menos frecuente que personas con un nivel medio o sin ella. Aún así, esta clara falta de predominio muestra que no es una variable muy a tener en cuenta pues no proporciona información relevante de cara a segmentar bien.
+
+Por ingresos:
+
+```{r}
+income<-table(datos_completos$income)
+income<-prop.table(income)
+income<-as.data.frame(income)
+names(income)<-c("Ingresos", "Porcentaje")
+
+ggplot(data=income, mapping=aes(x=Ingresos,Porcentaje)) + 
+  geom_col(fill="blue", alpha=0.5) +
+  scale_y_continuous(label=percent) +
+  labs(title="Nivel de ingresos",
+    subtitle="Nivel de ingresos por visitante",
+    x="", y="") +
+  theme_bw() + 
+  theme(title=element_text(size=14), axis.text=element_text(size=12)) +
+  theme(panel.grid.major.x = element_blank()) +
+  geom_text(mapping=aes(x=Ingresos, y=Porcentaje,
+                        label=percent(Porcentaje)), size=5, nudge_y=0.03)
+```
+
+Curiosamente más de la mitad de los visitantes posee bajos ingresos, con medios ingresos caen al 39% y de altos ingresos casi no hay visitantes. Esto es lo que suele ocurrir porque la gente de ingresos muy altos suele acudir a otro tipo de actos recreativos y a que su número no suele ser abundante en la sociedad, un aspecto a tener en cuenta en cuestiones de marketing.
+
+Para terminar, según regiones:
+
+```{r}
+region<-table(datos_completos$region)
+region<-prop.table(region)
+region<-as.data.frame(region)
+names(region)<-c("Region", "Porcentaje")
+
+ggplot(data=region, mapping=aes(x=Region,Porcentaje)) + 
+  geom_col(fill="blue", alpha=0.5) +
+  scale_y_continuous(label=percent) +
+  labs(title="Visitantes según regiones",
+    subtitle="Regiones de donde proceden los visitantes",
+    x="", y="") +
+  theme_bw() + 
+  theme(title=element_text(size=14), axis.text=element_text(size=12)) +
+  theme(panel.grid.major.x = element_blank()) +
+  geom_text(mapping=aes(x=Region, y=Porcentaje,
+                        label=percent(Porcentaje)), size=5, nudge_y=0.03)
+```
+
+Por regiones las personas que más acuden al parque con un 31% en total son las de Chicago seguidas de Milwaukee y de otras regiones. El parque se encuentra a 3 horas más o menos de Chicago que es el principal núcleo de población más cercano y de ahí la diferencia respecto a otras regiones. Minneapolis es la única ciudad en la que habría que plantearse si aumentar la publicidad para tratar de que sea más conocido el parque entre sus habitantes.
+
+Finalmente, es interesante ver la información relativa a las atracciones que han probado los clientes para conocer favoritas o poco populares. Para ello convierto en tabla esa parte del data frame y así se obtienen los totales para cada nivel:
+
+```{r}
+yes_no_datos<-as.data.frame(apply(datos_completos[,c(10:42)], 2, table))
+head(yes_no_datos)
+```
+
+Como resulta más efectivo organizarla al revés, traspongo el data frame para usarlo posteriormente:
+
+```{r}
+yes_no_datos_df<-yes_no_datos %>% t() %>% as.data.frame()
+head(yes_no_datos_df)
+```
+
+Para visualizar más claramente la cantidad de YES y NO en todas las variables, separo en 3 tramos las variables y las represento con gráficos de barras. Estas son las 10 primeras desde Antigüedades hasta Compras:
+
+```{r}
+ggplot(gather(as.data.frame(datos_completos[,c(10:20)])), aes(value)) +
+          geom_bar() + 
+          facet_wrap(~key, scales = 'free')+
+          theme_classic()+
+          labs(title="Personas que prueban o no las atracciones",
+            x="Respuesta", y="Nº de personas")
+```
+
+Llama la atención la diferencia que hay en Antiquing, Shopping o Hiking.
+Las siguientes 11 (desde parque de atracciones hasta parque acuático):
+
+```{r}
+ggplot(gather(as.data.frame(datos_completos[,c(21:32)])), aes(value)) +
+          geom_bar() + 
+          facet_wrap(~key, scales = 'free')+
+          theme_classic()+
+          labs(title="Personas que prueban o no las atracciones",
+            x="Respuesta", y="Nº de personas")
+```
+
+Entre estas, destacan Fishing, Golfing y Waterpark.
+Y las últimas 9 desde el pub hasta la standrock:
+
+```{r}
+ggplot(gather(as.data.frame(datos_completos[,c(32:42)])), aes(value)) +
+          geom_bar() + 
+          facet_wrap(~key, scales = 'free')+
+          theme_classic()+
+          labs(title="Personas que prueban o no las atracciones",
+            x="Respuesta", y="Nº de personas")
+```
+
+Estas últimas variables son las que presentan más disparidades decantándose siempre por un preominio de la no visita en algunas como Barpubdance o Bungeejumping.
+
+Y ahora compruebo cuáles son las atracciones que menos gustan a los clientes de la muestra (aquellas donde el número de NO es mayor al de YES) así como las que más debido a que algunas son de las favoritas y otras están prácticamente olvidadas:
+
+```{r}
+dislike<-yes_no_datos_df %>% filter(NO>YES) %>% arrange(desc(NO))
+like<-yes_no_datos_df %>% filter(NO<YES) %>% arrange(desc(YES))
+head(like,3)
+head(dislike,3)
+```
+
+Las más visitadas entre los clientes son ir de compras, el parque acuático y comprar en BroadWay mientras que las menos demandadas son el salto al vacío, teatro y helicóptero. Es importante conocer este tipo de datos para cuestiones de mantenimiento o mejora de las atracciones e intentar introducir cambios en las qu eno funcionan para que puedan igualar a las favoritas.
+
+En general, sepuede concluir que aquellas más de acción o de adultos no son muy frecuentadas debido, quizá a las visitas con niños (que prefieren atracciones más sencilla) o a la falta de atractivo en ellas.
+
+## Análisis con tablas de contingencia
+
+Como técnica exploratoria preliminar adicional, se puede usar la visualización que proporciona gmodels a modo de tablas de contingencia en combinación con dscr y crosstab. Por ejemplo, puede ser útil relacionar el número de noches que pasan los visitantes con su nivel de ingresos:
+
+```{r}
+CrossTable(datos_completos$nnights,datos_completos$income)
+```
+
+Fijándose en las filas y columnas, la gente con ingresos mayores suele pasar de 2 a 4 o más días en el parque, la gente de menores ingresos pasa mayoritariamente entre 1 y 3 días y la gente de ingresos medios se encuentra entre ambas franjas.
+
+Empleando un gráfico de mosaico:
+
+```{r}
+crosstab(datos_completos$nnights,datos_completos$income,
+         xlab = "Nivel de ingresos",
+         ylab="Número de noches")
+```
+
+También se puede ver cuál es el número de adultos que acuden en función de la region:
+
+```{r}
+CrossTable(datos_completos$region,datos_completos$nadults)
+crosstab(datos_completos$region,datos_completos$nadults,
+         xlab="Número de adultos",
+         ylab="Region")
+```
+
+# Análisis de correspondencias
+
+La mejor herramienta para observar relaciones entre todo este conjunto de variables es usando un análisis de correspondencias múltiple o MCA por ser las variables no cuantitativas. Primero obtengo el número de categorías que hay en cada una de las primeras 9 variables (las que explican características de los visitantes):
+
+```{r}
+categorias<-apply(datos_completos[,c(1:9)], 2, function(x) nlevels(as.factor(x)))
+categorias
+```
+
+Ahora aplico la función de MCA:
+
+```{r}
+mca1<-MCA(datos_completos[,c(1:9)], graph = FALSE)
+fviz_eig(mca1)
+```
+
+Al haber tantas variables, la que más varianza es capaz de recoger es la componente 1 con tan sólo el 6% de la total por lo que sólo se debe tomar la información como idea muy general del conjunto.
+
+Visualizando lo obtenido con la función MCA se obtiene la información sobre lo que es más habitual entre los visitantes y lo más extravagante. Además, coloreo según variables:
+
+```{r}
+mca1_vars_df = data.frame(mca1$var$coord, Variable = rep(names(categorias), categorias))
+
+mca1_obs_df = data.frame(mca1$ind$coord)
+
+ggplot(data=mca1_vars_df, 
+        aes(x = Dim.1, y = Dim.2, label = rownames(mca1_vars_df))) +
+        geom_hline(yintercept = 0, colour = "gray70") +
+        geom_vline(xintercept = 0, colour = "gray70") +
+        geom_text(aes(colour=Variable)) +
+        ggtitle("MCA plot of variables using R package FactoMineR")+
+        xlim(-1.5,2)
+```
+
+Rápidamente puede verse que los valores alejados del punto central son los menos habituales como que haya grupos de más de 5 integrantes, personas mayores de 65 años, gente de altos ingresos o que hayan planificado esta semana el viaje
+
+De igual forma repito el proceso para las variables que recogen la visita o no a las atracciones:
+
+```{r}
+categorias2<-apply(datos_completos[,c(10:42)], 2, function(x) nlevels(as.factor(x)))
+mca2<-MCA(datos_completos[,c(10:42)], graph = FALSE)
+fviz_eig(mca2)
+```
+
+En lo relatvo a las atracciones, a diferencia del caso anterior, las primeras componentes sí parecen recoger gran parte de la varianza total siendo lo recogido por la componente 1 del entorno del 15%.
+
+De igual manera que con las primeras 9 variables, se pueden representar las 2 primeras componentes mediante un gráfico del tipo biplot:
+
+```{r}
+mca2_vars_df = data.frame(mca2$var$coord, Variable = rep(names(categorias2), categorias2))
+
+mca2_obs_df = data.frame(mca2$ind$coord)
+
+ggplot(data=mca2_vars_df, 
+        aes(x = Dim.1, y = Dim.2, label = rownames(mca2_vars_df))) +
+        geom_hline(yintercept = 0, colour = "gray70") +
+        geom_vline(xintercept = 0, colour = "gray70") +
+        geom_text(aes(colour=Variable)) +
+        ggtitle("MCA plot of variables using R package FactoMineR")+
+        xlim(-1.5,2)
+```
+
+Con el gráfico, al igual que pasó antes, se visualizan aquellas actividades que suelen ser dejadas de lado por la gente pues es raro que vayan a concerttbeater, movietheater o hiking e igual de extraño que no visiten el amusepark, outdorrpool, etc. También es para resaltar el que estén distribuidas tanto a lo largo del eje de la componente 1 como a lo largo de la componente 2 lo que demuestra un amplio rango de posibilidades.
+
+Después de realizar el MCA de cada tipología de variables por separado, haré lo mismo pero para el conjunto entero:
+
+```{r}
+mca3<-MCA(datos_completos,graph = F)
+fviz_eig(mca3)
+```
+
+De nuevo, las primeras variables consiguen representar algo más de varianza perosigue estando muy lejos de lo que sería el mínimo del 50% aceptable. 
+
+Representando el biplot:
+
+```{r}
+fviz_mca_biplot(mca3,geom.ind = c("point"))
+```
+
+Se ve poco claro así que mejor representar las distintas categorías sin resaltar las observaciones:
+
+```{r}
+fviz_mca_var(mca3)
+```
+
+Se puede comprobar la gran influencia que tienen las respuestas sí y no y apreciar las atracciones donde más personas acuden y las menos populares a la vez que se combina con las características de cada encuestado.
+
+Esta misma idea de agrupar por componentes se puede aplicar para ver de una manera diferente al gráfico de barras la distribución de personas que acuden a unas atracciones u otras:
+
+```{r}
+plotellipses(mca3,keepvar=c(10:42),magnify = 1)
+```
+
+Es de mucha utilidad relacionar características y atracciones visitadas por lo que iremos comprobando cómo se influyen mediante sucesivos gráficos para cada característica.
+El primero de ellos servirá para ver grupos de clientes según número de noches:
+
+```{r}
+grp1 <- as.factor(datos_completos[, 1])
+fviz_mca_biplot(mca2, geom.ind = c("point"),
+                habillage=grp1,labelsize=4,col.var="black",
+                pointsize=3,
+                legend.title="Nnights")
+```
+
+Las conclusiones que se sacan de este gráfico son claras: las personas que pasan un menor número de noches en el parque no visitan las atracciones que, por lo general, son bien recibidas por la gente y se concentran sobre todo en aquellas atracciones no visitadas o fuera de lo usual (por falta de tiempo). A mayor número de noches, la gente va probando todas las atracciones y pasan a usar también aquellas que normalmente no se visitan como concertbeatter, moviethatre, etc.
+
+Por número de adultos:
+
+```{r}
+grp2 <- as.factor(datos_completos[, 2])
+fviz_mca_biplot(mca2, geom.ind = c("point"),
+                habillage=grp2,labelsize=4,col.var="black",
+                pointsize=3,
+                legend.title="Nadults")
+```
+
+En cuanto al número de adultos, no parece influir en la visita a las atracciones pues todos están repartidos uniformemente siendo claro el predominio de 2 adultos en prácticamente todas las atracciones.
+
+Según número de niños:
+
+```{r}
+grp3 <- as.factor(datos_completos[, 3])
+fviz_mca_biplot(mca2, geom.ind = c("point"),
+                habillage=grp3,labelsize=4,col.var="black",
+                pointsize=3,
+                legend.title="Nchildren")
+```
+
+Respecto al número de hijos, se aprecia que aquellas personas sin ellos hacen actividades más alejadas de lo usual (normalmente no visitando aquellas a las que todo el mundo va como waterpark o eatfastfoo) y esto demuestra que se acude a las atracciones de siempre o se dejan de visitar por la presencia de hijos. En el momento en que se tienen 1 o más, los clientes pasan a concentrarse en las atracciones más habituales.
+
+Pasando a planificiación:
+
+```{r}
+grp4 <- as.factor(datos_completos[, 4])
+fviz_mca_biplot(mca2, geom.ind = c("point"),
+                habillage=grp4,labelsize=4,col.var="black",
+                pointsize=3,
+                legend.title="Planification")
+```
+
+La planificación también es un condicionante respecto a las atracciones que se visitan pues la gente que ha preparado con más antelación está mucho más presente en aquellos puntos que representan un YES y concentradas también en lo considerado como habitual (el centro del biplot). Por otro lado, quienes planifican en la misma semana están mayoritariamente distribuidos en los NO con algunos en SI que serán quienes ya hayan visitado el parque con anterioridad y saben lo que visitar.
+
+Según el sexo:
+
+```{r}
+grp5 <- as.factor(datos_completos[, 5])
+fviz_mca_biplot(mca2, geom.ind = c("point"),
+                habillage=grp5,labelsize=4,col.var="black",
+                pointsize=3,
+                legend.title="Sex")
+```
+
+En el histograma del comienzo del trabajo era intuible que las variables a partir de aquí no iban a influir mucho en las atracciones a visitar, tal como demuestra el sexo pues todos los visitantes están distribuidos de manera más o menos uniforme en todo tipo de atracciones.
+
+Según edad:
+
+```{r}
+grp6 <- as.factor(datos_completos[, 6])
+fviz_mca_biplot(mca2, geom.ind = c("point"),
+                habillage=grp6,labelsize=4,col.var="black",
+                pointsize=3,
+                legend.title="Age")
+```
+
+En la edad también se distinguen agrupaciones como el que las personas más mayores tienden a no visitar las atracciones más queridas (pues coinciden con las que les gustan a los niños) o que los jóvenes menores de 25 años tienden a probar más todas las que pueden, concentrándose el resto de franjas de edades en la zona más central las cuales son más probables que vayan acompañados por los niños.
+
+Pasando a educación:
+
+```{r}
+grp7 <- as.factor(datos_completos[, 7])
+fviz_mca_biplot(mca2, geom.ind = c("point"),
+                habillage=grp7,labelsize=4,col.var="black",
+                pointsize=3,
+                legend.title="Education")
+```
+
+El nivel de educación, como es esperable, no es de relevancia a la hora de distinguir grupos, todos están distribuidos sin concentraciones.
+
+En cuanto a ingresos:
+
+```{r}
+grp8 <- as.factor(datos_completos[, 8])
+fviz_mca_biplot(mca2, geom.ind = c("point"),
+                habillage=grp8,labelsize=4,col.var="black",
+                pointsize=3,
+                legend.title="Income")
+```
+
+Los ingresos no son algo influyente tampoco en la visita a las atracciones siendo únicamente destacable que la gente de ingresos medios parece estar más centrada en la visita y la no visita a lo habitual. La gente de bajos ingresos no visita de manera tan pronunciada las atracciones más habituales tanto como los de medios ingresos.
+
+Finalmente, según la region:
+
+```{r}
+grp9 <- as.factor(datos_completos[, 9])
+fviz_mca_biplot(mca2, geom.ind = c("point"),
+                habillage=grp9,labelsize=4,col.var="black",
+                pointsize=3,
+                legend.title="Region")
+```
+
+Para terminar, la región de procedencia tampoco es relevante más allá de que la mayoría provienen de Chicago.
+
+Se puede concluir que lo que condiciona la visita a las atracciones no son factores generales de la gente (como estatus o procedencia) sino temas más relacionados con cuestiones físicas y palpables que rodean a los visitantes como la compañía con la que se acude, la planificación o la propia edad. Hay atracciones que pueden ser buenas, pero por el público que acude (mayoritariamente familiar o parejas) no triunfan y se recurre a otras más propias para niños (cuando se va con ellos).
+
+## Regresión logística para visitas a atracciones
+
+Como valor añadido para la empresa, le puede interesar tener algún tipo de predictor para saber cuál es la probabilidad de que un visitante acuda, por ejemplo, a alguna de las atracciones menos visitadas y esto se puede hacer con una regresión logística entre los valores YES o NO dependiendo de las características de las primeras 9 variables. Primero lo probaré con bungeejumping.
+
+A la hora de hacer regresiones, hay que separar los datos en train y test para conseguir mayor precisión:
+
+```{r}
+set.seed(123)
+training.samples <- datos_completos$nnights %>% 
+  createDataPartition(p = 0.8, list = FALSE)
+train.data  <- datos_completos[training.samples, ]
+test.data <- datos_completos[-training.samples, ]
+```
+
+Ajusto el modelo teniendo dejando fuera de la regresión aquellas variables que no tenían mucha influencia en las visitas como la region, educacion, nivel de ingresos y sexo:
+
+```{r}
+glm.fit <- glm(bungeejumping ~ nnights + nadults + nchildren + planning + age,
+               data = train.data,
+               family = binomial)
+summary(glm.fit)
+```
+
+En la salida obtenida puede verse que la edad y el número de noches son muy significativos para el modelo con un p-valor muy reducido.
+
+A continuación, muestro el vector de probabilidades que es con el que se asigna un YES o NO:
+
+```{r}
+glm.probs <- predict(glm.fit,
+                    newdata = test.data,
+                    type = "response")
+glm.probs[1:5]
+```
+
+Todas stas probabilidades son bastante cercanas a 0 como ya se esperaba para el caso de bungeejumping. Por último, se muestran las predicciones que realizaría en el conjunto que llamé datos test:
+
+```{r}
+glm.pred <- ifelse(glm.probs > 0.5, "YES", "NO")
+table(glm.pred,test.data[,"bungeejumping"])
+```
+
+Arrojaría un total de 311 NO y 27 YES, algo muy representativo de lo visto en todos los pasos anteriores y pudiendo concluir que no la visitaría.
+La fiabilidad del modelo es de:
+
+```{r}
+mean(glm.pred == test.data$bungeejumping)
+```
+
+Con una fiabilidad del 92%, la regresión es bastante precisa y puede usarse para, dadas unas características de un visitante, poder predecir si va a visitar o no alguna atracción.
+
+Como final, es de ayuda crear una función con la cual se podría predecir (según la atracción que se le introduza) cuantas personas la visitarían o no y la fiabilidad de la estimación:
+
+```{r}
+visita_atraccion<-function(atraccion){
+              set.seed(123)
+              training.samples <- datos_completos$nnights %>% 
+                createDataPartition(p = 0.8, list = FALSE)
+              train.data  <- datos_completos[training.samples, ]
+              test.data <- datos_completos[-training.samples, ]
+              
+              glm.fit <- glm(as.formula(paste(atraccion, " ~ nnights + nadults + nchildren + planning + age", sep = "")),
+                             data = train.data,
+                             family = binomial)
+              
+              glm.probs <- predict(glm.fit,
+                                  newdata = test.data,
+                                  type = "response")
+              
+              glm.pred <- ifelse(glm.probs > 0.5, "YES", "NO")
+              si_no<-table(glm.pred,test.data[,match(atraccion,names(train.data))])
+              efect<-mean(glm.pred == test.data[,match(atraccion,names(train.data))])
+              result<-list(si_no,efect)
+              return(result)
+}
+```
+
+Probando para algunas atracciones de las más y menos visitadas:
+
+```{r}
+visita_atraccion("antiquing")
+visita_atraccion("movietheater")
+visita_atraccion("shopping")
+```
+
+Obteniendo resultados coherentes con las características más relevantes de los visitantes.
+
+## Conclusiones
+
+Para concluir el trabajo, repasaré las cuestiones principales que planteaba la empresa.
+
+1. ¿Qué podemos aprender sobre la gente que visita las Dells? 
+
+A esta pregunta se le puede responder con el análisis descriptivo llevado a cabo al principio. Suelen acudir al parque personas de mediana edad (con 1 o 2 hijos frecuentemente) que o bien pasan el día en el parque y lo abandonan o tienen estancias de más de 2 días. más de la mitad son mujeres y el perfil de ingresos es entre medio y bajo.
+
+2.¿Hay patrones discernibles en las actividades de los visitantes? 
+
+Mediante el tratamiento con regresión logística y análisis descriptivo, podemos decir que las atracciones normalmente no frecuentadas son aquellas que consumen mucho tiempo de cada visitante como helicopter y bungeejumping o que se pueden hacer fácilmente sin acudir al parque como pubs o theater. 
+
+3.¿Es posible identificar segmentos de consumidores entre los visitantes? 
+
+Sí es posible hacerlo. Se destaca, sobre todo, según grupos de edad entre gente muy joven (menor de 25), mediana edad y mayores de 65, siendo los más abundantes los de mediana edad. También son destacables las pautas de planificación siendo lo predominante el planear todo con más de 1 mes de antelación. por último distinguir entre la gente con y sin hijos que realiza actividades diferentes (unos las menos usuales y los otros más centrados en actividades familiares)
+
+4. ¿Qué tipo de actividades recomendaríamos para los grupos de visitantes identificados por la demografía o el tipo de grupo de visitantes?
+
+Las conclusiones a esta pregunta están plasmadas en el análisis MCA pero, básicamente, 
+podemos decir que la gente que acude en grupos y con niños opta por actividades como el aquapark, las compras, la comida basura y las atracciones mientras que parejas o solteros sin hijos se decantan por otros estilos como el golf, horseride, etc.
+
+La publicidad debería ir enfocada a los habitantes de clase obrera de Chicago de mediana edad con hijos y poniendo la atención en actividades de toda la vida con las que disfrutar en familia como las ya mencionadas de aquapark o parque de atracciones.

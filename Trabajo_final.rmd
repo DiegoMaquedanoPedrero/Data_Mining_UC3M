@@ -1,0 +1,849 @@
+---
+title: "Trabajo final PCA y cluster tarjetas crédito"
+author: "Diego Maquedano Pedrero. NIU: 100385221"
+date: "10 enero 2021"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r, warning=FALSE, message=FALSE, fig.align='center', echo=FALSE}
+knitr::opts_chunk$set(warning=FALSE, message=FALSE, fig.align='center', echo=TRUE)
+```
+
+# Introducción y preproceso de los datos
+
+Esta práctica consiste en la realización de una segmentación de clientes en base a los datos aportados por tarjetas de crédito activas en los últimos 6 meses.
+
+Antes de empezar con todo el trabajo, empleo la siguiente función para comprobar si están descargados todos los paquetes que voy a emplear y, en caso contrario, descargarlos:
+
+```{r}
+comprobar <- function(pkg){
+    new.pkg <- pkg[!(pkg %in% installed.packages()[, "Package"])]
+    if (length(new.pkg)) 
+        install.packages(new.pkg, dependencies = TRUE)
+    sapply(pkg, require, character.only = TRUE)
+}
+paquetes<-c("tidyverse","factoextra","FactoMineR","plfm","cluster",
+            "ggplot2","VIM","mice","corrplot","psych","Hmisc","rgl",
+            "NbClust","anacor","ca","gplots","naniar","missMDA","gmodels",
+            "scales","descr","caret","magrittr","gridExtra","grid","PCAmixdata")
+comprobar(paquetes)
+```
+
+El primer paso consistiría en descargar los datos (se puede emplear choose.file() pero en markdown no funciona) en el directorio de trabajo a usar. Según cómo están configurados los datos, establezco que la primera columna sea el nombre de cada línea para más comodidad:
+
+```{r}
+setwd("C:/Users/Diego/Desktop/Introduction to data mining/Trabajo_final_individual_1")
+datos<-read.csv("datos_cluster.csv",row.names = 1)
+```
+
+Una vez hecho este paso, hay que observar si los datos necesitan algún tipo de preproceso en caso de que contengan datos faltantes, caracteres extraños, etc. Se puede hacer rápidamente con la función glimpse y obteniendo la suma de NA en cada variable:
+
+```{r}
+glimpse(datos)
+colSums(is.na(datos))
+apply(datos, 2, range)
+```
+
+A primera vista se pueden extraer bastantes conclusiones. En primer lugar, no hay variables categóricas puras (tipo texto), sólo numéricas y binarias pero algunas de ellas levantan sospecha como ONEOFF_PURCHASES_FREQUENCY que parece contener valores repetitivos y prefijados; no hay caracteres extraños pues ninguna variable está clasificada como string y hay 314 NA cuya presencia parece estar concentrada en la variable MINIMUM_PAYMENTS.
+
+Vizualizo los datos NA para confirmar la información extraída numéricamnete:
+
+```{r}
+gg_miss_var(datos)
+```
+
+Efectivamente, parece que todos los NA se concentran en esta variable. Viéndolo de otra manera:
+
+```{r}
+gg_miss_upset(datos)
+```
+
+Antes de empezar a analizar en profundidad, es necesario solucionar el problema de los NA y a la hora de lidiar con ellos, hay varias posibilidades. En primer lugar se puede proceder a su borrado, es decir, al borrado de aquellas observaciones que contengan el valor faltante siempre y cuando el dataset contenga suficientes observaciones. En este caso tenemos 8950 observaciones y 314 NA values casi no suponen el 3.5% del total.
+Como no se supera el 5% recomendado, no es una opción excluir las variable MINIMUM_PAYMENTS y teniendo posibilidad de imputarlos, es mejor hacerlo con el siguiente código:
+
+```{r}
+library(VIM)
+library(mice)
+plot_NA <- aggr(datos, col=c('green','red'), numbers=TRUE,
+                  sortVars=TRUE, labels=names(datos),
+                  cex.axis=.3,
+                  gap=3, ylab=c("Histogram of missing data","Pattern"))
+```
+
+Usando la librería VIM y mice y suponiendo que los datos faltantes son MCAR (totalmente aleatorios) he creado un gráfico el cual muestra la distribución de los NA y se confirma de nuevo su entera presencia en MIN_PAY.
+
+A continuación usaré el paquete mice para crear simulaciones sobre este dataset que ayuden a apredecir los NA y como la variable en la que se encuentra es numérica, el mejor método a usar es pmm de netre los muchos que posee esta función:
+
+```{r}
+datos_completos <- mice(datos,m=5,maxit=5,meth='pmm',seed=500)
+summary(datos_completos)
+datos<-complete(datos_completos,1)
+densityplot(datos_completos)
+```
+
+Tras generar los datos incompletos, creo el dataset de nuevo con esos datos añadidos y, echando un vistazo a las distribuciones de la simulación, parece que logran asemejarse a la distribución de la variable original.
+
+# Análisis descriptivo
+
+Dado que el objetivo es realizar un análisis cluster y de PCA, es conveniente hacer una revisión de las variables para conocer sus características y entender su comportamiento. EL paquete psych contiene una función que resume todas las variables del dataset:
+
+```{r}
+library(psych)
+describe(datos)
+```
+
+Se puede decir que hay bastantes variables que toman valores entre 0 y 1 pero ninguna propiamente binaria que tome únicamente valor 0 o 1. Lo que sí que hay son variables que podrían considerarse como categóricas al ser valores que se repiten y tienen una componente más descriptiva que cuantitativa y deberían ponerse como factor. Este detalle se puede ver fácilmente de la siguiente manera:
+
+```{r}
+unique_val<-datos %>% apply(2,unique) %>% lapply(length)
+barplot(unlist(unique_val),xlab="Variables",ylab="Total valores únicos",col="lightblue",cex.names = 0.5,las=2)
+```
+
+Con ese vistazo se puede saber que algunas de las variables poseen muy pocos valores diferentes, únicos, y que podrían considerarse como variables categóricas. También hay que tener en cuenta que puede haber muchos valores 0 y que eso haga parecer que lo son. Con el siguiente código puedo ver aquellos que tienen menos de 50 valores diferentes y ordenarlos para comparar si toman los mismos valores en cada una de las variables a las que pertenecen:
+
+```{r}
+datos_aux<-apply(datos, 2, unique)
+datos_aux<-lapply(datos_aux, sort)
+datos_aux[lapply(datos_aux, length)<50]
+```
+
+Efectivamente, las variables que llevan al final la palabra FREQUENCY tienen los mismos valores únicos y se podrían considerar como factores de cara al análisis cluster y PCA. TENURE también entra dentro de este grupo.
+
+Comprobar las distribuciones de cada una de las variables puede ser una buena idea de cara a saber cómo se distribuyen las variables y en los casos en que es necesario estandarizar:
+
+```{r}
+ggplot(gather(as.data.frame(datos)), aes(value)) + 
+          geom_histogram(bins = 15, color="blue", fill="white") + 
+          facet_wrap(~key, scales = 'free')+
+          theme_classic()
+```
+
+Las distribuciones distan mucho de ser normales y, además, poseen escalas muy dispares. Sin embargo, todas ellas permiten una segregación muy bien definida entre tipos de clientes por lo que aplicarles logaritmos podría eliminar esta información y concluimos que es mejor realizar solamente una estandarización en media. Esta segregación es muy clara en variables como Purchases Frequency o Installments Frequency permitiendo distinguir entre muy poca frecuencia y alta frecuencia.
+
+También podría ser interesante comprobar las correlaciones entre las distintas variables por ver cómo se influyen unas en otras. Para hacerlo, se puede usar una función que proporciona p-valores a cada una de las correlaciones y emplear eso luego para representar sólo aquellas que tengan un nivel de significación determinado (en este caso 1%):
+
+```{r}
+res2<-rcorr(as.matrix(datos))
+cor_matrix<-cor(datos)
+corrplot(res2$r, type="upper", order="hclust", 
+         p.mat = res2$P, sig.level = 0.01,
+         insig = "blank",tl.cex = 0.5,
+         tl.col = "black",
+         tl.srt = 45)
+```
+
+Estos datos arrojan información importante como que hay bastantes variables poco correlacionadas y en la gran mayoría de las que sí tienen correlación, esta es positiva. Hay algunas que que no poseen casi correlación con ninguna de las otras variables como TENURE, MINIMUM_PAYMENTS O BALANCE FREQUENCY y probaré a excluirlas del análisis PCA pues no van a proporcionar información extra y reduciendo el número de variables se incrementa la varianza explicada:
+
+```{r}
+datos2<-datos %>% select(-c(TENURE,MINIMUM_PAYMENTS,BALANCE_FREQUENCY))
+res2<-rcorr(as.matrix(datos2))
+cor_matrix<-cor(datos2)
+corrplot(res2$r, type="upper", order="hclust", 
+         p.mat = res2$P, sig.level = 0.01,
+         insig = "blank",tl.cex = 0.5,
+         tl.col = "black",
+         tl.srt = 45)
+```
+
+Dentro de este análisis preliminar exploraré más a fondo aquellas variables con más correlación o muy indicativas de la tipología de los clienets bancarios destacando BALANCE, PURCHASES, PAYMENTS o CASH_ADVANCE.
+
+Empezando con el BALANCE, es de suponer que se concentre en niveles cercanos a 0 euros y haya bastantes outliers:
+
+```{r}
+layout(mat = matrix(c(1,2),2,1, byrow=TRUE),  height = c(1,8))
+par(mar=c(0, 3.1, 1.1, 2.1))
+boxplot(datos$BALANCE , horizontal=TRUE , xaxt="n" , col=rgb(0.8,0.8,0,0.5) , frame=F)
+par(mar=c(4, 3.1, 1.1, 2.1))
+hist(datos$BALANCE, breaks=40 , col=rgb(0.2,0.8,0.5,0.5) , border=F , main="" , xlab="Saldo en cuenta")
+```
+
+Como puede verse, la enorme mayoría de los clientes (más del 75%) no superan los 5000 euros en cuenta pero hay muchos outliers que contribuyen a que la distribución tenga una cola muy gruesa hacia la derecha.
+
+En cuanto a la variable compras:
+
+```{r}
+layout(mat = matrix(c(1,2),2,1, byrow=TRUE),  height = c(1,8))
+par(mar=c(0, 3.1, 1.1, 2.1))
+boxplot(datos$PURCHASES , horizontal=TRUE , xaxt="n" , col=rgb(0.8,0.8,0,0.5) , frame=F)
+par(mar=c(4, 3.1, 1.1, 2.1))
+hist(datos$PURCHASES, breaks=40 , col=rgb(0.2,0.8,0.5,0.5) , border=F , main="" , xlab="Número de compras realizadas")
+```
+
+Las compras realizadas por cada usuario están de manera más clara que antes situadas cerca de 0 ya que no es habitual comprar con una frecuencia extrema. SI hubiera datos sobre las fechas en que se producen las transacciones, sería de mucha utilidad para saber los períodos en los que hay más demanda y en los que realizar campañas de captación.
+
+Pasando a los PAYMENTS
+
+```{r}
+layout(mat = matrix(c(1,2),2,1, byrow=TRUE),  height = c(1,8))
+par(mar=c(0, 3.1, 1.1, 2.1))
+boxplot(datos$PAYMENTS , horizontal=TRUE , xaxt="n" , col=rgb(0.8,0.8,0,0.5) , frame=F)
+par(mar=c(4, 3.1, 1.1, 2.1))
+hist(datos$PAYMENTS, breaks=40 , col=rgb(0.2,0.8,0.5,0.5) , border=F , main="" , xlab="Saldo en cuenta")
+```
+
+Los importes de las compras también se acumulan por debajo de los 10.000 pues la mayor parte de la gente no puede permitirse gastos muy elevados.
+
+Relativo a las variables que representan frecuencia, podemos usar gráficos para ver qué es lo más frecuente:
+
+```{r}
+bfreq<-table(datos$BALANCE_FREQUENCY)
+bfreq<-prop.table(bfreq)
+bfreq<-as.data.frame(bfreq)
+names(bfreq)<-c("Frecuencia", "Porcentaje")
+
+ggplot(data=bfreq, mapping=aes(x=Frecuencia, y=Porcentaje)) + 
+  geom_col(fill="orange", alpha=0.5) +
+  scale_y_continuous(label=percent) +
+  labs(title="Frecuencia de actualización del Balance",
+       x="", y="") +
+  theme_bw() + 
+  theme(title=element_text(size=14), axis.text=element_text(size=12)) +
+  theme(panel.grid.major.x = element_blank()) +
+  geom_text(mapping=aes(x=Frecuencia, y=Porcentaje,
+                        label=percent(Porcentaje)), size=3,
+                        nudge_y=0.03)+
+  coord_flip()
+```
+
+El 70% de los clientes actualizan el Balance de manera frecuente, es decir, son cuentas activas que realizan movimientos. Para el resto de posibles frecuencias sólo hay porcentajes distribuidos muy homogéneamente hasta completar el 30% restante.
+
+En cuanto a la frecuencia de las compras:
+
+```{r}
+pfreq<-table(datos$PURCHASES_FREQUENCY)
+pfreq<-prop.table(pfreq)
+pfreq<-as.data.frame(pfreq)
+names(pfreq)<-c("Frecuencia", "Porcentaje")
+
+ggplot(data=pfreq, mapping=aes(x=Frecuencia, y=Porcentaje)) + 
+  geom_col(fill="orange", alpha=0.5) +
+  scale_y_continuous(label=percent) +
+  labs(title="Frecuencia de compras",
+       x="", y="") +
+  theme_bw() + 
+  theme(title=element_text(size=14), axis.text=element_text(size=12)) +
+  theme(panel.grid.major.x = element_blank()) +
+  geom_text(mapping=aes(x=Frecuencia, y=Porcentaje,
+                        label=percent(Porcentaje)), size=3,
+                        nudge_y=0.03)+
+  coord_flip()
+```
+
+Por otro lado, la frecuencia de las compras nos muestra que hay un 20% de personas que compran muy frecuentemente, otro 20% que no compra nunca y el 60% resultante está repartido entre los valores intermedios por lo que puede ser considerado como factor a tener en cuenta a la hora de hacer grupos. Resaltar simplemente que es curiosa la disposición de las barras con un patrón que se repite a lo largo de todas la sfrecuencias.
+
+Tras analizar correlaciones y tener una idea general de los datos, pasaré a realizar el análisis de componenetes principales.
+
+# Análisis PCA y FAMD
+
+Hacer PCA no implica obtener interpretabilidad en los datos sino actuar como ayuda para hacerse una idea de las distribuciones. 
+En el apartado de análisis ya se ha visto que, pese a que todas las variables podrían considerarse numéricas, hay muchas que tienen parecido con categóricas por su caracter discreto. Por todo esto, realizaré 2 tipos de análisis, el PCA normal y el FAMD para ver las diferencias entre los distintos resultados.
+
+## PCA
+
+El primer paso que haré será escalar los datos al tener magnitudes muy dispares entre variables. Se puede usar la función scale o PCA que directamente crea el objeto de las componentes:
+
+```{r}
+datos_scaled<-scale(datos)
+pccomp_clientes<- PCA(datos_scaled,graph=F)
+fviz_eig(pccomp_clientes,addlabels = T,ylim=c(0,50))
+summary(pccomp_clientes)
+```
+
+Normalmente, en componentes principales con pocas variables la variablidad suele estar recogida casi al completo por las componentes 1 y 2 y en estos datos representan el 56.3% de la volatilidad. Ampliando la representación hasta la 4 dimensión se llegaría al 70% pero con una visualización imposible.
+
+Para establecer un límite sobre las dimensiones que son lo suficientemente aptas, fijaré que 1 sea el mínimo valor a escoger para los eigenvalues. Las variables que posean un eigenvalue menor que 1 estarían explicando menor variabilidad que una sola de las variables de por sí y, por tanto, son prescindibles. Para ello primero represento el screeplot con el límite horizontal de 1:
+
+```{r}
+pccomp_clientes2<-prcomp(datos,scale. = T)
+screeplot(pccomp_clientes2, type = "l", npcs = 15, main = "Gráfico de las primeras componentes")
+abline(h = 1, col="red", lty=5)
+legend("topright", legend=c("Eigenvalue = 1"),
+       col=c("red"), lty=5, cex=0.6)
+```
+
+Y a continuación la varianza en base a los componentes para ver cómo se comporta de manera asintótica hacia el 100%:
+
+```{r}
+cumpro <- cumsum(pccomp_clientes2$sdev^2 / sum(pccomp_clientes2$sdev^2))
+plot(cumpro[0:15], xlab = "PC #", ylab = "Varianza explicada", main = "Gráfico varianza acumulada")
+abline(v = 6, col="blue", lty=5)
+abline(h = 0.76, col="blue", lty=5)
+legend("topleft", legend=c("Punto Corte en PC6"),
+       col=c("blue"), lty=5, cex=0.6)
+```
+
+Con 6 componentes estaríaa explicando cerca del 80% de la varianza y, además, son las que poseen un eigenvalue superior a 1.
+
+En cuanto a la contribución que tiene cada variable sobre las componentes:
+
+```{r}
+fviz_pca_var(pccomp_clientes, col.var="contrib",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE # Avoid text overlapping
+             ) + theme_minimal() + ggtitle("Variables - PCA")
+```
+
+PURCHASES y las variables relacionadas con la retirada de efectivo parecen ser las que más contribuyen a las 2 componentes principales pero todas las demás también tienen contribuciones no muy por debajo destacando PAYMENTS y BALANCE.
+
+En datasets con variables categóricas, pueden usarse estas mismas variables para distinguir grupos dentro del PCA, se puede probar con TENURE y alguna de las que llevan asociada la palabra FREQUENCY para ver si es distinguible:
+
+```{r}
+groups <- as.factor(datos$TENURE)
+fviz_pca_ind(pccomp_clientes, geom.ind = "point", pointshape = 21, 
+             pointsize = 2, 
+             fill.ind = groups, 
+             col.ind = "black", 
+             palette = "Blues", 
+             addEllipses = TRUE,
+             label = "var",
+             col.var = "black",
+             legend.title = "TENURE") +
+  ggtitle("PCA con 2 compon. principales") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+Con este gráfico puede interpretarse que los clientes que poseen las tarjetas desde hace menos tiempo son los que están más cerca de la normalidad llegando la parte más cambiante en aquellos que poseen la tarjeta desde hace mínimo 12 meses. Es probable porque aquellos que llevan poco tiempo con ella puede ser que no confíen tanto en la marca aún o no tengan tanta confianza como para depositar mucho dinero en la cuenta, etc.
+
+En vez de con TENURE, introduzco como color alguna de las variables que representan frecuencia:
+
+```{r}
+fviz_pca_ind(pccomp_clientes, geom.ind = "point", pointshape = 21, 
+             pointsize = 2, 
+             fill.ind = as.factor(datos$PURCHASES_FREQUENCY), 
+             col.ind = "black",
+             label = "var",
+             col.var = "black",
+             legend.title = "Diagnosis") +
+  ggtitle("PCA con 2 compon. principales") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+Con PURCHASES_FREQUENCY, queda reflejado que aquellos clientes con una frecuencia más cercana a 0 están más explicados por la componente 2 mientras que los que están más cerca de 1 se distribuyen más a lo largo de la componente 1. Al principio del PCA, la componente 1 estaba muy relacionada con la variable PURCHASES y similares mientras que la componente 2 estaba más relacionada con el BALANCE y CASH_ADVANCE lo que muestra una diferenciación de clientes.
+
+Representando la contribución a la varianza a modo de correlograma:
+
+```{r}
+var <- get_pca_var(pccomp_clientes)
+corrplot(var$contrib,is.corr=F,tl.cex = 0.6,tl.col = "black")
+```
+
+Y la contribución de cada variable a las componentes 1 y 2:
+
+```{r}
+fviz_contrib(pccomp_clientes, "var", axes = 1)
+```
+
+Las que más afectan a la primera componente son las relacionadas con las compras y las variables que representan frecuencia:
+
+```{r}
+fviz_contrib(pccomp_clientes, "var", axes = 2)
+```
+
+Y las que influyen en la segunda componente son las de balance y el dinero en efectivo.
+
+Es lógico que sea así porque es lo que esperaría que identifique a la mayoría de clientes en este tipo de negocios.
+
+## FAMD
+
+Este método permite hacer PCA sobre conjuntos de datos mixtos (con variables categóricas o discretas y continuas). Para que proporcione información correcta, las variables consideradas factor no deben poseer muchos niveles, sino reflejar un número de grupos pequeño. De lo contrario, la variabilidad explicada será casi nula pues las variables no podrían ser consideradas como categóricas.
+
+Para ver esta peculiaridad creo 2 dataset, uno con todas las variables que podrían se rcategóricas transformadas en factor y otro sólo con TENURE como factor:
+
+```{r}
+columna <- c("TENURE")
+columnas<-c("BALANCE_FREQUENCY", "PURCHASES_FREQUENCY",
+              "ONEOFF_PURCHASES_FREQUENCY", "PURCHASES_INSTALLMENTS_FREQUENCY",
+              "CASH_ADVANCE_FREQUENCY","CREDIT_LIMIT",
+              "CASH_ADVANCE_TRX","PURCHASES_TRX",
+              "PRC_FULL_PAYMENT","TENURE")
+datos_famd_incorrectos<-datos
+datos_famd_correctos<-datos
+datos_famd_incorrectos[columnas] <- lapply(datos_famd_incorrectos[columnas], factor)
+datos_famd_correctos[columna]<- lapply(datos_famd_correctos[columna], factor)
+
+```
+
+Para ahora aplicar la función FAMD a cada una de las 2 posibilidades y comparar cuál resulta más fiable:
+
+```{r}
+res.famd.incorrect <- FAMD(datos_famd_incorrectos,ncp=5,graph = FALSE)
+
+a <- fviz_eig(res.famd.incorrect,  
+              choice='eigenvalue', 
+              geom='line') 
+b <- fviz_eig(res.famd.incorrect) 
+  
+grid.arrange(a, b, ncol=2)
+```
+
+La variabilidad explicada con las primeras 5 dimensiones no sobrepasaría el 5% y las conclusiones que ofrecería serían muy pobres.
+Usando sólo la variable TENURE que posee 5 niveles:
+
+```{r}
+res.famd.correct <- FAMD(datos_famd_correctos,ncp=5,graph = FALSE)
+
+a <- fviz_eig(res.famd.correct,  
+              choice='eigenvalue', 
+              geom='line') 
+b <- fviz_eig(res.famd.correct) 
+  
+grid.arrange(a, b, ncol=2)
+```
+
+Con las primeras 5 componentes estaría explicando el 54% de la variabilidad
+De esta manera, crearé un dataset alternativo reduciendo todos los niveles de frecuencias a menos de la mitad:
+
+0-0.25: Muy baja 
+0.26-0.5: Baja 
+0.51-0.75: Alta 
+0.76-1: Muy alta 
+
+Al sustituir tan sólo una de las observaciones por factor empleando criterios numéricos, el resto de código deja de funcionar por lo que sólo he podido hacer el proceso de sustitución intercambiando rangos de valores por un único número y luego sustituirlo por el texto.
+
+Para la variable ONEOFF_PURCHASES_FREQUENCY:
+
+```{r}
+dfreq<-datos
+dfreq$ONEOFF_PURCHASES_FREQUENCY<-replace(dfreq$ONEOFF_PURCHASES_FREQUENCY,dfreq$ONEOFF_PURCHASES_FREQUENCY<0.25,0.15)
+
+dfreq$ONEOFF_PURCHASES_FREQUENCY<-replace(dfreq$ONEOFF_PURCHASES_FREQUENCY,dfreq$ONEOFF_PURCHASES_FREQUENCY>=0.25 & dfreq$ONEOFF_PURCHASES_FREQUENCY<0.5,0.35)
+
+dfreq$ONEOFF_PURCHASES_FREQUENCY<-replace(dfreq$ONEOFF_PURCHASES_FREQUENCY,dfreq$ONEOFF_PURCHASES_FREQUENCY>=0.5 & dfreq$ONEOFF_PURCHASES_FREQUENCY<0.75,0.65)
+
+dfreq$ONEOFF_PURCHASES_FREQUENCY<-replace(dfreq$ONEOFF_PURCHASES_FREQUENCY,dfreq$ONEOFF_PURCHASES_FREQUENCY>=0.75,0.9)
+
+dfreq$ONEOFF_PURCHASES_FREQUENCY<-as.factor(dfreq$ONEOFF_PURCHASES_FREQUENCY)
+
+dfreq$ONEOFF_PURCHASES_FREQUENCY<-as.factor(ifelse(dfreq$ONEOFF_PURCHASES_FREQUENCY==0.15,"Muy baja",ifelse(dfreq$ONEOFF_PURCHASES_FREQUENCY==0.35,"Baja",ifelse(dfreq$ONEOFF_PURCHASES_FREQUENCY==0.65,"Alta","Muy alta"))))
+
+levels(dfreq$ONEOFF_PURCHASES_FREQUENCY)
+```
+
+Para la variable BALANCE_FREQUENCY:
+
+```{r}
+dfreq$BALANCE_FREQUENCY<-replace(dfreq$BALANCE_FREQUENCY,dfreq$BALANCE_FREQUENCY<0.25,0.15)
+
+dfreq$BALANCE_FREQUENCY<-replace(dfreq$BALANCE_FREQUENCY,dfreq$BALANCE_FREQUENCY>=0.25 & dfreq$BALANCE_FREQUENCY<0.5,0.35)
+
+dfreq$BALANCE_FREQUENCY<-replace(dfreq$BALANCE_FREQUENCY,dfreq$BALANCE_FREQUENCY>=0.5 & dfreq$BALANCE_FREQUENCY<0.75,0.65)
+
+dfreq$BALANCE_FREQUENCY<-replace(dfreq$BALANCE_FREQUENCY,dfreq$BALANCE_FREQUENCY>=0.75,0.9)
+
+dfreq$BALANCE_FREQUENCY<-as.factor(dfreq$BALANCE_FREQUENCY)
+
+dfreq$BALANCE_FREQUENCY<-as.factor(ifelse(dfreq$BALANCE_FREQUENCY==0.15,"Muy baja",ifelse(dfreq$BALANCE_FREQUENCY==0.35,"Baja",ifelse(dfreq$BALANCE_FREQUENCY==0.65,"Alta","Muy alta"))))
+
+levels(dfreq$BALANCE_FREQUENCY)
+```
+
+Para la variable PURCHASES_FREQUENCY:
+
+```{r}
+dfreq$PURCHASES_FREQUENCY<-replace(dfreq$PURCHASES_FREQUENCY,dfreq$PURCHASES_FREQUENCY<0.25,0.15)
+
+dfreq$PURCHASES_FREQUENCY<-replace(dfreq$PURCHASES_FREQUENCY,dfreq$PURCHASES_FREQUENCY>=0.25 & dfreq$PURCHASES_FREQUENCY<0.5,0.35)
+
+dfreq$PURCHASES_FREQUENCY<-replace(dfreq$PURCHASES_FREQUENCY,dfreq$PURCHASES_FREQUENCY>=0.5 & dfreq$PURCHASES_FREQUENCY<0.75,0.65)
+
+dfreq$PURCHASES_FREQUENCY<-replace(dfreq$PURCHASES_FREQUENCY,dfreq$PURCHASES_FREQUENCY>=0.75,0.9)
+
+dfreq$PURCHASES_FREQUENCY<-as.factor(dfreq$PURCHASES_FREQUENCY)
+
+dfreq$PURCHASES_FREQUENCY<-as.factor(ifelse(dfreq$PURCHASES_FREQUENCY==0.15,"Muy baja",ifelse(dfreq$PURCHASES_FREQUENCY==0.35,"Baja",ifelse(dfreq$PURCHASES_FREQUENCY==0.65,"Alta","Muy alta"))))
+```
+
+Para la variable CASH_ADVANCE_FREQUENCY:
+
+```{r}
+dfreq$CASH_ADVANCE_FREQUENCY<-replace(dfreq$CASH_ADVANCE_FREQUENCY,dfreq$CASH_ADVANCE_FREQUENCY<0.25,0.15)
+
+dfreq$CASH_ADVANCE_FREQUENCY<-replace(dfreq$CASH_ADVANCE_FREQUENCY,dfreq$CASH_ADVANCE_FREQUENCY>=0.25 & dfreq$CASH_ADVANCE_FREQUENCY<0.5,0.35)
+
+dfreq$CASH_ADVANCE_FREQUENCY<-replace(dfreq$CASH_ADVANCE_FREQUENCY,dfreq$CASH_ADVANCE_FREQUENCY>=0.5 & dfreq$CASH_ADVANCE_FREQUENCY<0.75,0.65)
+
+dfreq$CASH_ADVANCE_FREQUENCY<-replace(dfreq$CASH_ADVANCE_FREQUENCY,dfreq$CASH_ADVANCE_FREQUENCY>=0.75,0.9)
+
+dfreq$CASH_ADVANCE_FREQUENCY<-as.factor(dfreq$CASH_ADVANCE_FREQUENCY)
+
+dfreq$CASH_ADVANCE_FREQUENCY<-as.factor(ifelse(dfreq$CASH_ADVANCE_FREQUENCY==0.15,"Muy baja",ifelse(dfreq$CASH_ADVANCE_FREQUENCY==0.35,"Baja",ifelse(dfreq$CASH_ADVANCE_FREQUENCY==0.65,"Alta","Muy alta"))))
+```
+
+Para la variable PURCHASES_INSTALLMENTS_FREQUENCY:
+
+```{r}
+dfreq$PURCHASES_INSTALLMENTS_FREQUENCY<-replace(dfreq$PURCHASES_INSTALLMENTS_FREQUENCY,dfreq$PURCHASES_INSTALLMENTS_FREQUENCY<0.25,0.15)
+
+dfreq$PURCHASES_INSTALLMENTS_FREQUENCY<-replace(dfreq$PURCHASES_INSTALLMENTS_FREQUENCY,dfreq$PURCHASES_INSTALLMENTS_FREQUENCY>=0.25 & dfreq$PURCHASES_INSTALLMENTS_FREQUENCY<0.5,0.35)
+
+dfreq$PURCHASES_INSTALLMENTS_FREQUENCY<-replace(dfreq$PURCHASES_INSTALLMENTS_FREQUENCY,dfreq$PURCHASES_INSTALLMENTS_FREQUENCY>=0.5 & dfreq$PURCHASES_INSTALLMENTS_FREQUENCY<0.75,0.65)
+
+dfreq$PURCHASES_INSTALLMENTS_FREQUENCY<-replace(dfreq$PURCHASES_INSTALLMENTS_FREQUENCY,dfreq$PURCHASES_INSTALLMENTS_FREQUENCY>=0.75,0.9)
+
+dfreq$PURCHASES_INSTALLMENTS_FREQUENCY<-as.factor(dfreq$PURCHASES_INSTALLMENTS_FREQUENCY)
+
+dfreq$PURCHASES_INSTALLMENTS_FREQUENCY<-as.factor(ifelse(dfreq$PURCHASES_INSTALLMENTS_FREQUENCY==0.15,"Muy baja",ifelse(dfreq$PURCHASES_INSTALLMENTS_FREQUENCY==0.35,"Baja",ifelse(dfreq$PURCHASES_INSTALLMENTS_FREQUENCY==0.65,"Alta","Muy alta"))))
+```
+
+Para la variable CREDIT_LIMIT distinguiré entre grupos por debajo del primer cuartil, entre el primer y el tercer cuartil y por encima del tercer cuartil (de menos a más solventes):
+
+```{r}
+summary(dfreq$CREDIT_LIMIT)
+```
+
+```{r}
+dfreq$CREDIT_LIMIT<-replace(dfreq$CREDIT_LIMIT,dfreq$CREDIT_LIMIT<1600,1000)
+
+dfreq$CREDIT_LIMIT<-replace(dfreq$CREDIT_LIMIT,dfreq$CREDIT_LIMIT>=1600 & dfreq$CREDIT_LIMIT<6500,4000)
+
+dfreq$CREDIT_LIMIT<-replace(dfreq$CREDIT_LIMIT,dfreq$CREDIT_LIMIT>=6500,7000)
+
+dfreq$CREDIT_LIMIT<-as.factor(dfreq$CREDIT_LIMIT)
+
+dfreq$CREDIT_LIMIT<-as.factor(ifelse(dfreq$CREDIT_LIMIT==1000,"Bajo",ifelse(dfreq$CREDIT_LIMIT==4000,"Medio","Elevado")))
+```
+
+Para la variable CASH_ADVANCE_TRX tomaremos el mismo criterio de los cuartiles para ditinguir entre pocas, medias y muchas:
+
+```{r}
+summary(dfreq$CASH_ADVANCE_TRX)
+boxplot(dfreq$CASH_ADVANCE_TRX)
+```
+
+El resultado parece indicar que lo extraño es que sean más de 0 pues la mediana toma ese valor así que distinguiremos entre los que tengan 0 y los que no:
+
+```{r}
+dfreq$CASH_ADVANCE_TRX<-replace(dfreq$CASH_ADVANCE_TRX,dfreq$CASH_ADVANCE_TRX>0,1)
+
+dfreq$CASH_ADVANCE_TRX<-as.factor(dfreq$CASH_ADVANCE_TRX)
+
+dfreq$CASH_ADVANCE_TRX<-as.factor(ifelse(dfreq$CASH_ADVANCE_TRX==0,"NO","SI"))
+```
+
+Para la variable PURCHASES_TRX:
+
+```{r}
+summary(dfreq$PURCHASES_TRX)
+boxplot(dfreq$PURCHASES_TRX)
+```
+
+El 75% de las observaciones ha realizado menos de 17 compras así que tomaré esto como nivel para segmentar:
+
+```{r}
+dfreq$PURCHASES_TRX<-replace(dfreq$PURCHASES_TRX,dfreq$PURCHASES_TRX<17,0)
+
+dfreq$PURCHASES_TRX<-replace(dfreq$PURCHASES_TRX,dfreq$PURCHASES_TRX>=17,1)
+
+dfreq$PURCHASES_TRX<-as.factor(dfreq$PURCHASES_TRX)
+
+dfreq$PURCHASES_TRX<-as.factor(ifelse(dfreq$PURCHASES_TRX==0,"Pocas","Muchas"))
+```
+
+Para la variable PRC_FULL_PAYMENT:
+
+```{r}
+dfreq$PRC_FULL_PAYMENT<-replace(dfreq$PRC_FULL_PAYMENT,dfreq$PRC_FULL_PAYMENT<0.25,0.15)
+
+dfreq$PRC_FULL_PAYMENT<-replace(dfreq$PRC_FULL_PAYMENT,dfreq$PRC_FULL_PAYMENT>=0.25 & dfreq$PRC_FULL_PAYMENT<0.5,0.35)
+
+dfreq$PRC_FULL_PAYMENT<-replace(dfreq$PRC_FULL_PAYMENT,dfreq$PRC_FULL_PAYMENT>=0.5 & dfreq$PRC_FULL_PAYMENT<0.75,0.65)
+
+dfreq$PRC_FULL_PAYMENT<-replace(dfreq$PRC_FULL_PAYMENT,dfreq$PRC_FULL_PAYMENT>=0.75,0.9)
+
+dfreq$PRC_FULL_PAYMENT<-as.factor(dfreq$PRC_FULL_PAYMENT)
+
+dfreq$PRC_FULL_PAYMENT<-as.factor(ifelse(dfreq$PRC_FULL_PAYMENT==0.15,"Muy baja",ifelse(dfreq$PRC_FULL_PAYMENT==0.35,"Baja",ifelse(dfreq$PRC_FULL_PAYMENT==0.65,"Alta","Muy alta"))))
+```
+
+Y finalmente, para TENURE habrá que distinguir entre los que lleven menos de 12 meses o 12 en adelante:
+
+```{r}
+dfreq$TENURE<-replace(dfreq$TENURE,dfreq$TENURE<12,0)
+
+dfreq$TENURE<-replace(dfreq$TENURE,dfreq$TENURE>=12,1)
+
+dfreq$TENURE<-as.factor(dfreq$TENURE)
+
+dfreq$TENURE<-as.factor(ifelse(dfreq$TENURE==0,"Nuevos","Antiguos"))
+```
+
+Con esto ya concluiría la parte de hacer grupos y el resultado que ofrecería FAMD con estas modificaciones es:
+
+```{r}
+res.famd.grupos <- FAMD(dfreq,ncp=5,graph = FALSE)
+
+a <- fviz_eig(res.famd.grupos,  
+              choice='eigenvalue', 
+              geom='line') 
+b <- fviz_eig(res.famd.grupos) 
+  
+grid.arrange(a, b, ncol=2)
+
+summary(res.famd.grupos$eig)
+```
+
+Con las primeras 5 variables conseguiría explicar un 42% de la varianza, menos que sin introducir tantos grupos como al principio pero no un resultado tan poco aclarativo como si consideramos todos los factores como grupos individuales. Ahora es posible continuar con el análisis usando estos datos y crear gráficos variados para ver estas influencias.
+
+Como cuantas más dimensiones se usen, más fidedigna es la distribución de los puntos a la realidad, usaré un gráfico 3D usando la laibrería Plotly para representar 3 componentes probando con algunos de los factores creados. Este tipo de gráfico es interactivo, por lo que no he podido pasarlo a PDF y es el motivo de que el documento sea HTML.
+
+La primera distribución que me gustaría comprobar es la de CREDIT_LIMIT:
+
+```{r}
+library(plotly)
+val_df <- as.data.frame(res.famd.grupos$ind)
+
+x <- cbind(dfreq, val_df[1:3])
+
+## Plot
+plot_ly(x, 
+        x = ~coord.Dim.1, 
+        y = ~coord.Dim.2, 
+        z = ~coord.Dim.3, 
+        color = ~CREDIT_LIMIT,
+        size = 15) 
+```
+Usando esta clasificación es bastante claro que los clientes más abundantes son los que tienen límites más altos y que se reparten de manera más uniforme a lo largo de las dimensiones 1 y 2 mientras que los de bajo límite se concentran en el codo, la zona más usual.
+
+También según la frecuencia de las compras:
+
+```{r}
+val_df2 <- as.data.frame(res.famd.grupos$ind)
+
+x <- cbind(dfreq, val_df2[1:3])
+
+## Plot
+plot_ly(x, 
+        x = ~coord.Dim.1, 
+        y = ~coord.Dim.2, 
+        z = ~coord.Dim.3, 
+        color = ~PURCHASES_FREQUENCY,
+        size=20) 
+```
+
+Las personas con frecuencias altas están repartidas a lo largo de la componente 1 y las de baja frecuencia a lo largo de la componente 2 habiendo una separación muy clara entre ambas.
+
+En cuanto al análisis de los cos2:
+
+```{r}
+fviz_famd_var(res.famd.grupos, 'var', 
+              axes = c(1, 2),
+              col.var = 'cos2')
+```
+
+La información que muestra el gráfico es que Balance, Cash Advance y Purchases son las que más explican componentes 1 y 2 al estar más alejadas del centro. Variables como Payments o Purchases_Installments_Frequency tienden a ser explicadas más por una combinación de ambas dimensiones.
+
+Para entender mejor la relación entre los tipos de variables y las dimensiones se puede emplear el paquete PCAmixdata de la siguiente manera:
+
+```{r}
+split <- splitmix(dfreq)
+res.pcamix <- PCAmix(X.quanti=split$X.quanti,  
+                     X.quali=split$X.quali,
+                     rename.level = T)
+res.pcarot <- PCArot(res.pcamix, dim=2,
+                     graph=FALSE)
+plot(res.pcarot, choice="sqload", 
+     coloring.var=TRUE, axes=c(1, 2))
+```
+
+Las variables con flechas más largas son las que más contribuyen a la varianza total del conjunto. Muchas son categóricas pero las PURCHASES, PAYMENTS y BALANCE también contribuyen mucho.
+
+# Análisis Cluster
+
+Como parte final del trabajo, toca hacer análisis cluster para terminar de dar forma a los distintos grupos vistos durante los análisis PCA y FAMD previos. Para empezar usaré el conjunto de datos modificado, con las variables categóricas:
+
+```{r}
+datos_cluster<-dfreq
+```
+
+Y se crea la matriz de distancias con el método Gower al no tener sentido usar el método kmeans:
+
+```{r}
+gower_dist<-daisy(datos_cluster,metric = "gower")
+gower_mat<-as.matrix(gower_dist)
+summary(gower_dist)
+```
+
+Para ver si no está mal planteado, echo un vistazo a  cuáles son los 2 clientes más similares según las distancias de Gower:
+
+```{r}
+datos_cluster[which(gower_mat == min(gower_mat[gower_mat != min(gower_mat)]), arr.ind = TRUE)[1, ], ]
+```
+
+Y los más diferentes:
+ 
+```{r}
+datos_cluster[which(gower_mat == max(gower_mat[gower_mat != max(gower_mat)]), arr.ind = TRUE)[1, ], ]
+```
+
+Ambos resultados muestran bastante coherencia con lo que esperaríamos ver pues los más parecidos tienen un saldo en cuenta similar, las mismas frecuencias, etc. Todo lo contrario sucede con los más diferentes por lo que parece que va bien encaminado el análisis.
+
+Para ver el número óptimo de clusters que crear, al ser un dataset muy grande, es preferible coger una muestra y extraer de ella las conclusiones. Para ello:
+
+```{r}
+set.seed(123)
+datos_reducidos<-sample_n(datos_cluster,4000)
+gower_dist2<-daisy(datos_reducidos,metric = "gower")
+gower_mat2<-as.matrix(gower_dist2)
+summary(gower_dist2)
+```
+
+Si comparo los datos de esta matriz de distancias reducida con los anteriores, se ve que no hay una gran diferencia entre los valores. La máxima distancia, por ejemplo, en este es 0.8006 y en el completo es de 0.7926 y la media es en este 0.2934 y en el completo de 0.2905. Son prácticamente iguales y se pueden extrapolar los resultados de uno al otro.
+
+Por tanto, según esta muestra de todos los clientes, el número óptimo de grupos sería: 
+
+```{r}
+sil_width <- c(NA)
+for(i in 2:7){
+  
+  pam_fit <- pam(gower_dist2,
+                 diss = TRUE,
+                 k = i)
+  
+  sil_width[i] <- pam_fit$silinfo$avg.width
+  
+}
+# Plot sihouette width (higher is better)
+plot(1:7, sil_width,
+     xlab = "Número de Clusters",
+     ylab = "Silhouette Width")
+lines(1:7, sil_width)
+```
+
+Muestra que el número óptimo de grupos 2, 3 o 4 aproximadamente.
+
+Probaré primero con 4 pues es el punto que actuaría de codo en el gráfico y si el análisis no resulta muy efectivo investigamos si con 3 es más preciso:
+
+```{r}
+pam_fit<-pam(gower_dist,diss = TRUE,k=4)
+```
+
+Las observaciones más representativas de cada grupo serían:
+
+```{r}
+datos_cluster[pam_fit$medoids, ]
+```
+
+Para ver las características de cada uno de los clusters:
+
+```{r}
+pam_results <- datos_cluster %>%
+  mutate(cluster = pam_fit$clustering) %>%
+  group_by(cluster) %>%
+  do(the_summary = summary(.))
+pam_results$the_summary
+```
+
+Antes de centrarse en las características, represento para ver cómo serían los grupos teniendo en cuenta que no hay que escalar aquellas variables que son factores:
+
+```{r}
+datos_scaled_cluster<-scale(select(datos_cluster,-c(BALANCE_FREQUENCY,
+                    PURCHASES_FREQUENCY,
+                    ONEOFF_PURCHASES_FREQUENCY,
+                    PURCHASES_INSTALLMENTS_FREQUENCY,
+                    PRC_FULL_PAYMENT,
+                    CASH_ADVANCE_FREQUENCY,
+                    CREDIT_LIMIT,
+                    CASH_ADVANCE_TRX,
+                    PURCHASES_TRX,
+                    TENURE)))
+            
+pam_fit$data<-datos_scaled_cluster
+fviz_cluster(pam_fit,
+             palette = c("#00AFBB", "green","#FC4E07","red"), 
+             ellipse.type = "t", 
+             geom = c("point"),
+             ggtheme = theme_classic())
+```
+
+Al haber muchas variables, una representación en 2D no permite distinguir con precisión cómo se distribuyen los distintos grupos por lo que aquí también es interesante hacer una representación 3D sobre la descomposición de FAMD coloreando con los cluster que he obtenido como resultado de aplicar el algoritmo PAM:
+
+```{r}
+val_df2 <- as.data.frame(res.famd.grupos$ind)
+
+dfreq$CLUSTER<-pam_fit$clustering
+
+x <- cbind(dfreq, val_df2[1:3])
+
+## Plot
+plot_ly(x, 
+        x = ~coord.Dim.1, 
+        y = ~coord.Dim.2, 
+        z = ~coord.Dim.3, 
+        color = ~CLUSTER,
+        size=20)
+```
+
+Así se distingue la distribución a lo largo de la tercera componente mucho mejor y cobra más sentido la presencia de 4 tipos de clientes.
+
+Usando polígonos de confianza, primero se crea un dendograma:
+
+```{r}
+dendograma_gower<-hclust(gower_dist, method="complete")
+plot(dendograma_gower)
+```
+
+Y el código para representar:
+
+```{r}
+fviz_cluster(list(data = datos_scaled_cluster, cluster = cutree(dendograma_gower,4)),
+        palette = c("#2E9FDF", "#00AFBB","orange","blue"),
+        ellipse.type = "convex", 
+        show.clust.cent = FALSE, 
+        geom = c("point"),
+        pointsize = 0.5,
+        ggtheme = theme_minimal()
+)
+```
+
+Este último no permite distinguir muy adecuadamente y hace parecer que se produce mucho solapamiento entre clusters. De otra manera:
+
+```{r}
+fviz_cluster(pam_fit, data = datos_scaled_cluster,
+             palette = c("red","blue","yellow","green"),
+             ellipse.type = "norm", # elipse de concentración
+             pointsize = 0.5,
+             geom = c("point"),
+             ggtheme = theme_minimal()
+)
+```
+
+A continuación iré describiendo las características numéricas propias de cada cluster:
+
+```{r}
+result<-datos_cluster[pam_fit$medoids, ]
+result
+```
+
+Como hay muchas variables por la parte descriptiva, es mejor analizar los mediodes o las observaciones más representativas para cada uno de los grupos y contrastar las conclusiones que se pueden sacar de cada uno con las características de su grupo:
+
+```{r}
+result[1,]
+pam_results$the_summary[[1]]
+```
+
+Respecto al primer grupo, estaría representado por clientes antiguos con un saldo en cuenta bajo, que realizan relativamente bastantes compras pero las que realizan no son de una vez sino a plazos y por ello los adelantos de efectivo son muy bajos o inexistentes. El límite de crédito que poseen es normal, medio y destacan más porque los pagos (como recibos) sí son más frecuentes que las compras por lo que parece tratarse de clientes estándar que tienen la cuenta tanto para domiciliar recibos como para realizar compras cotidianas pero sin endeudarse en exceso.
+
+```{r}
+result[2,]
+pam_results$the_summary[[2]]
+```
+
+El segundo grupo de clientes, está constituido por clientes que tienen el saldo en cuenta más elevado de todos los grupos (siempre atendiendo a la mediana para evitar sesgos por los outliers). Las compras que tienen son muy reducidas pero los adelantos de efectivo y los pagos sí son elevados. Parece ser el tipo de clientes solvente que no se dedica tanto al gasto sino que usan la cuenta más como soporte para recibos o para realziar aportaciones a fondos de pensiones o de inversión.
+
+```{r}
+result[3,]
+pam_results$the_summary[[3]]
+```
+
+El tercer grupo de clientes está compuesto por clientes con un saldo en cuenta medio-alto pero que, a diferencia del segundo grupo, tienen una elevada cantidad de compras con importes también altos. Los pagos igualmente tienen la cuantía de los del segundo grupo pero una diferencia notable es que no solicitan apenas anticipos de efectivo y tienen la mayor cantidad de representantes con límite de crédito alto. Parece tratarse de clientes solventes que pueden permitirse realizar compras y pagoos sin necesidad de endeudarse o pedir anticipos.
+
+```{r}
+result[4,]
+pam_results$the_summary[[4]]
+```
+
+El último grupo de clientes está formado por personas con poca capacidad adquisitiva (pues tienen los menores saldos), el límite de crédito es eminentemente bajo y, acorde a ello, las compras no son frecuentes ni elevados. Sí se nota más relevancia de los pagos (pues serán sobre todo pagos de recibos) y tampoco solicitan anticipos de efectivo ya que no abordarán compras de importes muy elevados.
+
+

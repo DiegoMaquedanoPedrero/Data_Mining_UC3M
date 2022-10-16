@@ -1,0 +1,378 @@
+---
+title: "Trabajo Final Grupal."
+author: "Diego Maquedano Pedrero, Lucas Martínez López, José Antonio Vaquero Chaves"
+date: "10/01/2021"
+output: html_document
+---
+
+```{r, warning=FALSE, message=FALSE, fig.align='center', echo=FALSE}
+knitr::opts_chunk$set(warning=FALSE, message=FALSE, fig.align='center', echo=TRUE)
+```
+
+# Introducción y preproceso de los datos
+
+Como trabajo final hemos escogido el fichero con los datos correspondientes al World Economic Freedom Index con la intención de conocer en mayor profundidad cómo se relacionan parámetros económicos con la libertad de la población y su evolución a lo largo de los últimos 20 años.
+
+Lo primero que debemos hacer es cargar los datos. Desde Markdown no se pueden ejecutar los comando choose.files() ni choose.dir() por lo que si se intenta replicar se pueden usar tales comandos para elegir el directorio en el que estamos trabajando y esos mismos datos. En nuestro caso, vamos a fijar el directorio que estamos usando.
+
+```{r}
+#Usar choose.dir() y choose.file() si se quiere replicar
+setwd("C:/Users/Diego/Desktop/Introduction to data mining/Trabajo_final_grupal")
+datos<-read.csv("DataSet.csv",row.names = 2,dec = ".",header = T)
+datos$CountryID<-NULL
+datos$WEBNAME<-NULL
+datos$Country<-NULL
+```
+Con este primer código hemos descargado los datos del csv fijando como nombre de filas cada uno de los países, poniendo usar como separador decimal el símbolo "." y después eliminando las variables Country ID, WEBPAGE y Country puesto que son redundantes y no aportan ninguna informmación.
+
+También revisamos si tenemos los paquetes que vamos a ir necesitando y si están instalados los cargamos mientras que si no, también se instalan
+
+```{r}
+comprobar <- function(pkg){
+    new.pkg <- pkg[!(pkg %in% installed.packages()[, "Package"])]
+    if (length(new.pkg)) 
+        install.packages(new.pkg, dependencies = TRUE)
+    sapply(pkg, require, character.only = TRUE)
+}
+paquetes<-c("tidyverse","factoextra","FactoMineR",
+            "ggplot2","VIM","mice","corrplot")
+comprobar(paquetes)
+```
+
+
+Ahora echamos un vistazo a los datos para conocer su estructura con un head
+
+```{r}
+head(datos)
+```
+Casi todas las variables parecen estar bien salvo las columnas 23 y 26 que presentan símbolos "$" y caracteres no numéricos por lo que para un correcto análisis deberemos solucionarlo.
+Primero nos deshacemos del símbolo "$"
+
+```{r}
+datos$GDP..Billions..PPP.<-gsub('[$]','',datos$GDP..Billions..PPP.)
+datos$GDP.per.Capita..PPP.<-gsub('[$]','',datos$GDP.per.Capita..PPP.)
+```
+
+A continuación eliminamos los espacios al final de cada número
+
+```{r}
+datos$GDP..Billions..PPP.<-trimws(datos$GDP..Billions..PPP.)
+datos$GDP.per.Capita..PPP.<-trimws(datos$GDP.per.Capita..PPP.) 
+```
+
+Por último se deben eliminar las comas de los miles usando de nuevo gsub. Guardamos la región en una variable porque al hacer lapply con as.numeric debemos evitar los strings y lo añadimos después.
+
+```{r}
+datos$GDP..Billions..PPP.<-as.numeric(gsub(',','',datos$GDP..Billions..PPP.))
+datos$GDP.per.Capita..PPP.<-as.numeric(gsub(',','',datos$GDP.per.Capita..PPP.))
+datos$FDI.Inflow..Millions.<-as.numeric(gsub(',','',datos$FDI.Inflow..Millions.))
+region<-datos$Region
+nombres<-rownames(datos)
+datos<-as.data.frame(lapply(datos[,-1], as.numeric))
+datos$Region<-region
+rownames(datos)<-nombres
+```
+
+Una vez están limpiados los datos, vemos su estructura para verificarlo y también comprobamos si hay valores N/A
+
+```{r}
+str(datos)
+sum(is.na(datos))
+```
+
+Todas las variables ya son numéricas a (a excepción de la región) pero hay 102 valores que son NA y que debemos sustituir por valores para poder hacer un análisis adecuado pues eliminar las obervaciones no es ideal al no disponer de un tamaño grande de muestra.
+
+No existe una sobre cuántos NA son aceptables o cuándo hay que eliminar las observaciones pero el convenio es que no es bueno que una variable contenga más de un 5% de valores NA. Para ver esto, usamos el siguiente comando.
+
+```{r}
+NAtotales <- function(x){sum(is.na(x))/length(x)*100}
+apply(datos,2,NAtotales)
+```
+Lo que devuelve esta función es el porcentaje de NA para cada variable. 
+Ninguna está por encima del 5% así que lo mejor es emplear métodos que rellenen esos valores.
+
+Para entender cómo es la ausencia de datos y tratar de predecirlos usaremos los paquetes VIM y mice.
+A continuación se muestra una representación de los datos faltantes
+
+```{r}
+library(VIM)
+aggr_plot <- aggr(datos, col=c('navyblue','red'), numbers=TRUE, sortVars=TRUE, labels=names(data), cex.axis=.5, gap=1, ylab=c("Histogram of missing data","Pattern"))
+```
+
+La información que nos proporciona es que un 93% de las observaciones no contiene ningún NA.
+Con el paquete mice podemos solventar bastante bien la imputación de los datos.
+
+```{r}
+library(mice)
+datos_sustituidos <- mice(datos,m=5,maxit=5,method ='pmm',seed=500)
+summary(datos_sustituidos)
+```
+
+En este caso se han generado 5 datasets copia al original con 5 iteraciones para cada uno (con más potencia se podría hacer más veces) y mediante media predictiva o pmm obtiene predicciones de los valores faltantes.
+
+Con la función complete, obtenemos el dataset original con los datos que faltaban ya fijados.
+
+```{r}
+datos <- complete(datos_sustituidos,1)
+```
+
+Comprobamos la densidad de los datos "copiados" en magenta para cada una de las variables con la distribución que siguen los originales (en azul) y salvo los datos muy atípicos, vemos que se ajustan bastante bien.
+
+```{r}
+densityplot(datos_sustituidos)
+```
+
+# Análisis descriptivo
+
+Una vez tenemos los datos con el formato deseado es posible comenzar a realizar un análisis sobre ellos. El dataframe posee muchas variables que pueden ser analizadas y puede conllevar interpretaciones poco claras por lo que primero realizaremos un análisis de las correlaciones entre todas y luego llevaremos a cabo el análisis descriptivo de aquellos grupos de variables más correlacionadas.
+
+Para hacer un corrplot en el que se puedan tener en cuenta todas las variables, hemos creado una función para obtener las correlaciones más grandes y luego representarlas en un gráfico claro.
+
+```{r}
+library(tidyverse)
+library(corrplot)
+corr_simple <- function(data=df,sig=0.5){
+          #convert data to numeric in order to run correlations
+          #convert to factor first to keep the integrity of the data - each value will become a number rather than turn into NA
+          df_cor <- data %>% mutate_if(is.character, as.factor)
+          df_cor <- df_cor %>% mutate_if(is.factor, as.numeric)
+          #run a correlation and drop the insignificant ones
+          corr <- cor(df_cor)
+          #prepare to drop duplicates and correlations of 1     
+          corr[lower.tri(corr,diag=TRUE)] <- NA 
+          #drop perfect correlations
+          corr[corr == 1] <- NA 
+          #turn into a 3-column table
+          corr <- as.data.frame(as.table(corr))
+          #remove the NA values from above 
+          corr <- na.omit(corr) 
+          #select significant values  
+          corr <- subset(corr, abs(Freq) > sig) 
+          #sort by highest correlation
+          corr <- corr[order(-abs(corr$Freq)),] 
+          #print table
+          print(corr)
+          #turn corr back into matrix in order to plot with corrplot
+          mtx_corr <- reshape2::acast(corr, Var1~Var2, value.var="Freq")
+          
+          #plot correlations visually
+          corrplot(mtx_corr, is.corr=FALSE, tl.col="black", na.label=" ")
+}
+corr_simple(datos)
+```
+
+La información que obtenemos es un poco confusa porque lo que indica el corrplot es que el World Rank está inversamente relacionado con las variables que esperaríamos que estuviesen directamente relacionadas como Investment.Freedom, Business.Freedom, etc.
+Por ello decidimos transformar esta columna para ponerla de acuerdo a la lógica.
+
+```{r}
+datos$World.Rank = max(datos$World.Rank) - datos$World.Rank
+```
+
+Ahora el gráfico muestra una correlación positiva como cabría esperar y sólo tener en cuenta que el puesto 1 es ahora el peor y el 150 el mejor, el que mejor puntuación posee en las variables
+
+```{r}
+corr_simple(datos)
+```
+
+En primer lugar vamos a dividir el dataframe en 3 partes de 10 variables cada una para evaluar la influencia que tienen en World.Rank en el análisis descriptivo. Una de las partes será la que posea más correlación, otra con algo menos y finalmente las que menos tengan. Posteriormente para realizar el análisis PCA, cluster y conclusiones globales, emplearemos el global.
+
+```{r}
+datos_1<-datos %>% select(World.Rank, #PARA JOSE
+                          X2019.Score,
+                          Property.Rights,
+                          Judical.Effectiveness,
+                          Government.Integrity,
+                          Fiscal.Health,
+                          Business.Freedom,
+                          Monetary.Freedom,
+                          Trade.Freedom,
+                          Investment.Freedom,
+                          Financial.Freedom,
+                          Region) %>%
+                              arrange(by=World.Rank)
+
+datos_2<- datos %>% select(World.Rank, #PARA DIEGO
+                          X2019.Score,
+                          Tax.Burden,
+                          Labor.Freedom,
+                          Tariff.Rate....,
+                          Gov.t.Expenditure...of.GDP,
+                          GDP.per.Capita..PPP.,
+                          Income.Tax.Rate....,
+                          Corporate.Tax.Rate....,
+                          Tax.Burden...of.GDP,
+                          GDP..Billions..PPP.,
+                          Region) %>%
+                              arrange(by=World.Rank)
+
+datos_3<-datos %>% select(World.Rank, # PARA LUCAS
+                          X2019.Score,
+                          Population..Millions.,
+                          GDP.Growth.Rate....,
+                          Tariff.Rate....,
+                          X5.Year.GDP.Growth.Rate....,
+                          Unemployment....,
+                          Inflation....,
+                          FDI.Inflow..Millions.,
+                          Public.Debt....of.GDP.,
+                          Region) %>%
+                              arrange(by=World.Rank)
+
+```
+
+Respecto a las variables con más correlación, podemos decir que. MIRAR SUS DISTRIBUCIONES CON HISTOGRAMAS Y BOXPLOTS, SUMMARYS, ALGUN PCA SI QUEREIS
+
+```{r}
+summary(datos_1)
+```
+Todas las variables están expresadas en porcentajes por lo que puede ser útil su visualización a través de histogramas y density plots.
+
+```{r}
+boxplot(datos_1[,-12],horizontal = T, las=2)
+library(corrplot)
+library(psych)
+pairs.panels(datos_1,scale=T,main="Matriz de dispersion, Histograma y correlacion")
+#
+ggplot(datos_1,aes(x=World.Rank))+geom_histogram(aes(y=..density..),colour="black",fill="white")+geom_density(alpha=.3,fill="yellow")
+
+ggplot(datos_1,aes(x=X2019.Score))+geom_histogram(aes(y=..density..),colour="black",fill="white")+geom_density(alpha=.3,fill="yellow")
+
+ggplot(datos_1,aes(x=Property.Rights))+geom_histogram(aes(y=..density..),colour="black",fill="white")+geom_density(alpha=.3,fill="yellow")
+
+ggplot(datos_1,aes(x=Judical.Effectiveness))+geom_histogram(aes(y=..density..),colour="black",fill="white")+geom_density(alpha=.3,fill="yellow")
+
+ggplot(datos_1,aes(x=Government.Integrity))+geom_histogram(aes(y=..density..),colour="black",fill="white")+geom_density(alpha=.3,fill="yellow")
+boxplot(datos_1[5], main="Government Inegrity")
+
+ggplot(datos_1,aes(x=Fiscal.Health))+geom_histogram(aes(y=..density..),colour="black",fill="white")+geom_density(alpha=.3,fill="yellow")
+
+ggplot(datos_1,aes(x=Business.Freedom))+geom_histogram(aes(y=..density..),colour="black",fill="white")+geom_density(alpha=.3,fill="yellow")
+
+ggplot(datos_1,aes(x=Monetary.Freedom))+geom_histogram(aes(y=..density..),colour="black",fill="white")+geom_density(alpha=.3,fill="yellow")
+
+ggplot(datos_1,aes(x=Trade.Freedom))+geom_histogram(aes(y=..density..),colour="black",fill="white")+geom_density(alpha=.3,fill="yellow")
+
+ggplot(datos_1,aes(x=Investment.Freedom))+geom_histogram(aes(y=..density..),colour="black",fill="white")+geom_density(alpha=.3,fill="yellow")
+
+ggplot(datos_1,aes(x=Financial.Freedom))+geom_histogram(aes(y=..density..),colour="black",fill="white")+geom_density(alpha=.3,fill="yellow")
+```
+Interpretando los histogramas con sus respectivos gráficos de densidad, podemos extraer interesantes conclusiones. La puntuación de 2019 se concentra sobre todo entre 50 y 75% lo que idica que la mayoría de países poseen un nivel por encima del aprobado y los outilers que se dan son más negativos que excelentes.
+
+En cuanto a los derechos de propiedad, la mayoría se concentran entre entre 25 y 75% con un pequeño incremento en la densidad entre el 75 y 100%
+
+La eficacia judicial deja bastante que desear en general pues casi todos los países se encuentran por debajo del aprobado en esta variable
+
+EN Government Integrity, el 75% de los países tiene un suspenso y sólo se compensa con algunos outliers que tienen excelente puntuación.
+
+
+
+```{r}
+boxplot(datos_1[,-12],horizontal = T, las=2)
+
+```
+
+También 
+
+```{r}
+library(factoextra)
+library(FactoMineR)
+pc_datos1<-PCA(datos_1[,-c(2,12)])
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ DE AQUI PARA ABAJO SON COSAS QUE SE ME IBAN OCURRIENDO, ESTAN EN SUCIO
+Disminuyendo el número de variables a considerar, el porcentaje de variabilidad explicado por componentes principales aumenta considerablemente pasando de apenas un 50% a un 74.75%
+
+Hay que tratar de poner todas las variables en la misma dirección porque Worl.rank cuanto más alto es peor pero interpretamos normalmente que cuanto más alto es mejor. MIRAR PDF QUE HAY SUBIDO SOBRE LA HEPTATLON
+
+Muchos de los datos tienen montañitas, es decir presencia de grupos, normalidad en las distribuciones
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
